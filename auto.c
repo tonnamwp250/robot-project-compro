@@ -19,10 +19,35 @@
 // 1 = ปริ้นค่าเซนเซอร์สีเมื่อเริ่มต่ำ (ใช้ตอนแก้ปัญหาเท่านั้น)
 #define TAPE_DEBUG 0
 
+// =====================================================
+//  STRUCTURE
+// =====================================================
+// เซนเซอร์ ToF 1 ตัว
+struct ToFSensor {
+  VL53L0X  dev;        // ตัวไลบรารี
+  uint8_t  xshutPin;   // ขา XSHUT
+  uint8_t  addr;       // I2C address ใหม่
+  uint16_t dist;       // ค่าที่อ่านล่าสุด (mm)
+};
+
+// มอเตอร์ 1 ข้าง
+struct Motor {
+  uint8_t in1;
+  uint8_t in2;
+  uint8_t en;
+  int     trim;        // ชดเชยความเร็ว (บวก = เร็วขึ้น)
+};
+
 // ---------- VL53L0X ----------
 // L = เฉียงซ้าย, F = หน้า, R = เฉียงขวา
-VL53L0X sensorL, sensorF, sensorR;
-const int XSHUT_L = 10, XSHUT_F = 9, XSHUT_R = 8;
+const uint8_t IDX_L = 0, IDX_F = 1, IDX_R = 2;
+const uint8_t TOF_COUNT = 3;
+
+// ARRAY: เก็บเซนเซอร์ ToF ทั้ง 3 ตัว
+ToFSensor tof[TOF_COUNT];
+const uint8_t  TOF_XSHUT[TOF_COUNT] = {10, 9, 8};
+const uint8_t  TOF_ADDR[TOF_COUNT]  = {0x30, 0x31, 0x32};
+const char*    TOF_NAME[TOF_COUNT]  = {"L", "F", "R"};
 
 // ---------- GY-9960 (APDS9960) ติดหลังสุดใต้ตัว ----------
 SparkFun_APDS9960 apds;
@@ -49,8 +74,6 @@ const int BASE_SPEED = 100;    // วิ่งตรง
 const int MIN_SPEED  = 90;     // ความเร็วตอนใกล้กำแพงหน้า
 const int MIN_MOTOR  = 70;     // ล้อข้างที่ช้ากว่าห้ามต่ำกว่านี้ (กันมอเตอร์หยุด)
 const int TURN_SPEED = 120;    // ความเร็วตอนหมุน
-const int TRIM_L = 0;          // ชดเชยมอเตอร์สองข้างไม่เท่ากัน (บวก = เร็วขึ้น)
-const int TRIM_R = 0;
 
 // ---------- เวลา (ms) ต้องปรับตามหุ่นจริง ----------
 const int ALIGN_R_MS    = 420; // เดินต่อก่อนเลี้ยวขวาที่ช่องเปิด
@@ -63,10 +86,16 @@ const int PARK_MS       = 40;  // เดินต่อหลังเจอเ�
 const int PARK_SPEED    = 50;  // ความเร็วตอนคืบเข้าโซน
 
 // ---------- Motor (L298N) ----------
-const int enL = 6, L1 = 4, L2 = 7;
-const int R1 = 3, R2 = 2, enR = 5;
+// ARRAY ของ struct: motors[0] = ซ้าย, motors[1] = ขวา  {in1, in2, en, trim}
+const uint8_t M_LEFT = 0, M_RIGHT = 1;
+Motor motors[2] = {
+  {4, 7, 6, 0},    // ซ้าย  : L1=4, L2=7, enL=6, TRIM_L=0
+  {3, 2, 5, 0}     // ขวา   : R1=3, R2=2, enR=5, TRIM_R=0
+};
 
-uint8_t openL = 0, openR = 0;
+// ARRAY: นับรอบที่เห็นช่องเปิดติดกัน [0] = ซ้าย, [1] = ขวา
+uint8_t openCnt[2] = {0, 0};
+const uint8_t SIDE_IDX[2] = {IDX_L, IDX_R};   // แปลงด้านเป็น index ของ tof[]
 
 // =====================================================
 void setup() {
@@ -74,25 +103,26 @@ void setup() {
   Wire.begin();
   Wire.setClock(400000);          // I2C 400 kHz อ่านเซนเซอร์เร็วขึ้น
 
-  pinMode(enL, OUTPUT);
-  pinMode(L1, OUTPUT);
-  pinMode(L2, OUTPUT);
-  pinMode(R1, OUTPUT);
-  pinMode(R2, OUTPUT);
-  pinMode(enR, OUTPUT);
+  // LOOP: ตั้งค่าขามอเตอร์ทุกข้าง
+  for (int i = 0; i < 2; i++) {
+    pinMode(motors[i].in1, OUTPUT);
+    pinMode(motors[i].in2, OUTPUT);
+    pinMode(motors[i].en, OUTPUT);
+  }
   brake();
 
-  pinMode(XSHUT_L, OUTPUT);
-  pinMode(XSHUT_F, OUTPUT);
-  pinMode(XSHUT_R, OUTPUT);
-  digitalWrite(XSHUT_L, LOW);
-  digitalWrite(XSHUT_F, LOW);
-  digitalWrite(XSHUT_R, LOW);
+  // LOOP: ปิด ToF ทุกตัวก่อน แล้วค่อยเปิดทีละตัวเพื่อตั้ง address
+  for (int i = 0; i < TOF_COUNT; i++) {
+    tof[i].xshutPin = TOF_XSHUT[i];
+    tof[i].addr     = TOF_ADDR[i];
+    tof[i].dist     = 8190;
+    pinMode(tof[i].xshutPin, OUTPUT);
+    digitalWrite(tof[i].xshutPin, LOW);
+  }
   delay(10);
-
-  initToF(sensorL, XSHUT_L, 0x30);
-  initToF(sensorF, XSHUT_F, 0x31);
-  initToF(sensorR, XSHUT_R, 0x32);
+  for (int i = 0; i < TOF_COUNT; i++) {
+    initToF(&tof[i]);             // POINTER: ส่งที่อยู่ของ struct เข้าไป
+  }
 
   if (!apds.init()) Serial.println(F("APDS-9960 init failed!"));
   if (!apds.enableProximitySensor(false)) Serial.println(F("Proximity enable failed!"));
@@ -114,26 +144,39 @@ void setup() {
   delay(1000);
 }
 
-void initToF(VL53L0X &s, int xshut, uint8_t addr) {
-  digitalWrite(xshut, HIGH);
+// POINTER: s ชี้ไปที่ struct ของเซนเซอร์ตัวที่ต้องการตั้งค่า
+void initToF(ToFSensor *s) {
+  digitalWrite(s->xshutPin, HIGH);
   delay(10);
-  s.setTimeout(500);
-  if (!s.init()) Serial.println(F("ToF init failed"));
-  s.setAddress(addr);
-  s.setMeasurementTimingBudget(20000);
-  s.startContinuous();
+  s->dev.setTimeout(500);
+  if (!s->dev.init()) Serial.println(F("ToF init failed"));
+  s->dev.setAddress(s->addr);
+  s->dev.setMeasurementTimingBudget(20000);
+  s->dev.startContinuous();
 }
 
 // อ่าน ToF โดยระหว่างรอข้อมูลพร้อม จะวนเช็คเทปดำตลอด (ไม่ค้างรอเฉย ๆ)
-uint16_t readToF(VL53L0X &s) {
+// เก็บผลลง s->dist และคืนค่าด้วย
+uint16_t readToF(ToFSensor *s) {
   unsigned long t0 = millis();
-  while ((s.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) == 0) {
+  while ((s->dev.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) == 0) {
     checkTape();
-    if (millis() - t0 > 500) return 8190;       // timeout -> ถือว่าไกลมาก
+    if (millis() - t0 > 500) {                  // timeout -> ถือว่าไกลมาก
+      s->dist = 8190;
+      return s->dist;
+    }
   }
-  uint16_t v = s.readRangeContinuousMillimeters();
-  if (s.timeoutOccurred() || v > 8000) v = 8190;
+  uint16_t v = s->dev.readRangeContinuousMillimeters();
+  if (s->dev.timeoutOccurred() || v > 8000) v = 8190;
+  s->dist = v;
   return v;
+}
+
+// LOOP: อ่าน ToF ทั้ง 3 ตัว เก็บลง tof[i].dist
+void readAllToF() {
+  for (int i = 0; i < TOF_COUNT; i++) {
+    readToF(&tof[i]);
+  }
 }
 
 // =====================================================
@@ -160,9 +203,12 @@ void loop() {
   delay(100);
   return;
 #elif MODE == 2
-  Serial.print(F("L: ")); Serial.print(readToF(sensorL));
-  Serial.print(F("  F: ")); Serial.print(readToF(sensorF));
-  Serial.print(F("  R: ")); Serial.println(readToF(sensorR));
+  readAllToF();
+  for (int i = 0; i < TOF_COUNT; i++) {
+    Serial.print(TOF_NAME[i]); Serial.print(F(": ")); Serial.print(tof[i].dist);
+    Serial.print(F("  "));
+  }
+  Serial.println();
   delay(100);
   return;
 #elif MODE == 3
@@ -174,16 +220,19 @@ void loop() {
 #endif
 
   checkTape();
-  uint16_t SL = readToF(sensorL);
-  uint16_t SF = readToF(sensorF);
-  uint16_t SR = readToF(sensorR);
+  readAllToF();
+  uint16_t SL = tof[IDX_L].dist;
+  uint16_t SF = tof[IDX_F].dist;
+  uint16_t SR = tof[IDX_R].dist;
 
-  // นับรอบที่เห็นช่องเปิดติดกัน กันค่าหลอก
-  openL = (SL > DIAG_OPEN) ? min(openL + 1, 10) : 0;
-  openR = (SR > DIAG_OPEN) ? min(openR + 1, 10) : 0;
+  // LOOP: นับรอบที่เห็นช่องเปิดติดกัน (ซ้าย/ขวา) กันค่าหลอก
+  for (int i = 0; i < 2; i++) {
+    uint16_t d = tof[SIDE_IDX[i]].dist;
+    openCnt[i] = (d > DIAG_OPEN) ? min(openCnt[i] + 1, 10) : 0;
+  }
 
-  bool leftOpen   = openL >= OPEN_CONFIRM;
-  bool rightOpen  = openR >= OPEN_CONFIRM;
+  bool leftOpen   = openCnt[0] >= OPEN_CONFIRM;
+  bool rightOpen  = openCnt[1] >= OPEN_CONFIRM;
   bool frontBlock = SF < FRONT_STOP;
 
   // กฎมือซ้าย: ซ้ายโล่ง -> เลี้ยวซ้าย, หน้าโล่ง -> ตรง, ขวาโล่ง -> เลี้ยวขวา,
@@ -213,7 +262,9 @@ void loop() {
   }
 }
 
-void resetOpen() { openL = 0; openR = 0; }
+void resetOpen() {
+  for (int i = 0; i < 2; i++) openCnt[i] = 0;
+}
 
 // รอแบบเช็คเทปดำตลอด (ใช้แทน delay ทุกช่วงที่หุ่นเคลื่อนที่หรือเพิ่งหยุด)
 void waitMs(unsigned long ms) {
@@ -255,11 +306,9 @@ void driveCentered(uint16_t SL, uint16_t SF, uint16_t SR) {
 void driveMs(unsigned long ms) {
   unsigned long t0 = millis();
   while (millis() - t0 < ms) {
-    uint16_t SL = readToF(sensorL);
-    uint16_t SF = readToF(sensorF);
-    uint16_t SR = readToF(sensorR);
-    if (SF < FRONT_MIN) break;
-    driveCentered(SL, SF, SR);
+    readAllToF();
+    if (tof[IDX_F].dist < FRONT_MIN) break;
+    driveCentered(tof[IDX_L].dist, tof[IDX_F].dist, tof[IDX_R].dist);
   }
   brake();
   waitMs(60);
@@ -274,18 +323,12 @@ unsigned long t90(bool toRight) {
 
 // หมุนอยู่กับที่ตามเวลา (กระตุกออกตัวก่อน แล้วลดเป็นความเร็วหมุน) เช็คเทปตลอด
 void turn(bool toRight, unsigned long ms) {
-  if (toRight) {
-    digitalWrite(L1, HIGH); digitalWrite(L2, LOW);
-    digitalWrite(R1, LOW);  digitalWrite(R2, HIGH);
-  } else {
-    digitalWrite(L1, LOW);  digitalWrite(L2, HIGH);
-    digitalWrite(R1, HIGH); digitalWrite(R2, LOW);
-  }
-  analogWrite(enL, 255);
-  analogWrite(enR, 255);
+  // เลี้ยวขวา: ล้อซ้ายเดินหน้า ล้อขวาถอย / เลี้ยวซ้าย: กลับกัน
+  motorRun(&motors[M_LEFT],  255,  toRight);
+  motorRun(&motors[M_RIGHT], 255, !toRight);
   waitMs(KICK_MS);
-  analogWrite(enL, constrain(TURN_SPEED + TRIM_L, 0, 255));
-  analogWrite(enR, constrain(TURN_SPEED + TRIM_R, 0, 255));
+  motorRun(&motors[M_LEFT],  TURN_SPEED,  toRight);
+  motorRun(&motors[M_RIGHT], TURN_SPEED, !toRight);
   waitMs(ms > KICK_MS ? ms - KICK_MS : 0);
   brake();
   waitMs(200);                   // รอให้หุ่นนิ่งก่อนเดินต่อ
@@ -331,19 +374,26 @@ void parkAndStop() {
 // =====================================================
 //  Motor
 // =====================================================
-void setMotors(int sl, int sr) {
-  sl = constrain(sl + TRIM_L, 0, 255);
-  sr = constrain(sr + TRIM_R, 0, 255);
-  digitalWrite(L1, HIGH); digitalWrite(L2, LOW);
-  digitalWrite(R1, HIGH); digitalWrite(R2, LOW);
-  analogWrite(enL, sl);
-  analogWrite(enR, sr);
+// POINTER: m ชี้ไปที่ struct ของมอเตอร์ข้างที่ต้องการสั่ง
+void motorRun(Motor *m, int speed, bool forward) {
+  digitalWrite(m->in1, forward ? HIGH : LOW);
+  digitalWrite(m->in2, forward ? LOW : HIGH);
+  analogWrite(m->en, constrain(speed + m->trim, 0, 255));
 }
 
-// เบรกแบบ short (หยุดเร็วกว่าปล่อยไหล)
+// เบรกแบบ short ข้างเดียว (หยุดเร็วกว่าปล่อยไหล)
+void motorBrake(Motor *m) {
+  digitalWrite(m->in1, HIGH);
+  digitalWrite(m->in2, HIGH);
+  analogWrite(m->en, 255);
+}
+
+void setMotors(int sl, int sr) {
+  motorRun(&motors[M_LEFT],  sl, true);
+  motorRun(&motors[M_RIGHT], sr, true);
+}
+
+// LOOP: เบรกมอเตอร์ทุกข้าง
 void brake() {
-  digitalWrite(L1, HIGH); digitalWrite(L2, HIGH);
-  digitalWrite(R1, HIGH); digitalWrite(R2, HIGH);
-  analogWrite(enL, 255);
-  analogWrite(enR, 255);
+  for (int i = 0; i < 2; i++) motorBrake(&motors[i]);
 }
